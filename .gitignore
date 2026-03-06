@@ -1,0 +1,30 @@
+# macOS
+.DS_Store
+
+# Xcode user state
+DerivedData/
+xcuserdata/
+*.xcuserstate
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+*.hmap
+*.ipa
+*.dSYM
+*.dSYM.zip
+
+# SwiftPM build artifacts
+.build/
+.swiftpm/
+*/.build/
+*/.swiftpm/
+
+# Local tooling
+.claude/
+CLAUDE.md
+
+# Editor/temp files
+*.moved-aside
+*.swp
+*~

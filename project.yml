@@ -1,0 +1,44 @@
+name: MLXChat
+options:
+  bundleIdPrefix: com.mlxchat
+  deploymentTarget:
+    iOS: "26.0"
+  xcodeVersion: "16.0"
+
+packages:
+  mlx-swift-lm:
+    url: https://github.com/ml-explore/mlx-swift-lm
+    branch: main
+  swift-transformers:
+    url: https://github.com/huggingface/swift-transformers
+    from: "1.1.9"
+
+targets:
+  MLXChat:
+    type: application
+    platform: iOS
+    sources: [MLXChat]
+    resources:
+      - MLXChat/Assets.xcassets
+    settings:
+      base:
+        CODE_SIGN_ENTITLEMENTS: MLXChat/MLXChat.entitlements
+        PRODUCT_BUNDLE_IDENTIFIER: com.mlxchat.MLXChat
+        MARKETING_VERSION: "1.0.0"
+        CURRENT_PROJECT_VERSION: "1"
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_UILaunchScreen_Generation: true
+        INFOPLIST_KEY_NSCameraUsageDescription: "Take photos to send to the AI model"
+        INFOPLIST_KEY_NSLocationWhenInUseUsageDescription: "Use your approximate location in system prompt variables when relevant"
+        INFOPLIST_KEY_NSPhotoLibraryUsageDescription: "Select photos to send to the AI model"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SWIFT_VERSION: "5.9"
+    dependencies:
+      - package: mlx-swift-lm
+        product: MLXLMCommon
+      - package: mlx-swift-lm
+        product: MLXLLM
+      - package: mlx-swift-lm
+        product: MLXVLM
+      - package: swift-transformers
+        product: Tokenizers
