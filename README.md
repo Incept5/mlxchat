@@ -94,11 +94,55 @@ Supported tools:
 - `web_search`
 - `url_fetch`
 
+### `web_search`
+
+Purpose:
+
+- search the web for current or recent information
+
+When it is useful:
+
+- news
+- recent company updates
+- current events
+- anything where the answer is likely to have changed recently
+
+Requirements:
+
+- requires a Brave Search API key in Settings
+
+Example prompts:
+
+- `What is in the news about the Qwen team today?`
+- `Search the web for recent MLX updates from Apple.`
+- `What happened with Alibaba Qwen this week?`
+
+### `url_fetch`
+
+Purpose:
+
+- fetch and read the text content of a specific web page
+
+When it is useful:
+
+- the user gives a direct URL
+- the model needs to summarize a specific page
+- the user wants content extracted from a known document or article URL
+
+Requirements:
+
+- no API key required
+
+Example prompts:
+
+- `Please read https://qwenlm.github.io/ and summarise it.`
+- `What does this page say? https://huggingface.co/Qwen/Qwen3.5-4B`
+- `Fetch https://unsloth.ai/docs/models/qwen3.5 and tell me how thinking is controlled.`
+
 Notes:
 
-- `web_search` requires a Brave Search API key
-- `url_fetch` works without Brave
 - the app prefetches obvious URL and current-info requests before generation, then asks the model to answer from the retrieved result
+- for normal conversation, tools are intentionally not included in every turn
 
 ## Tool-Calling Tips For Other Technologists
 
