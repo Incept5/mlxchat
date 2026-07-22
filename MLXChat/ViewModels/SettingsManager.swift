@@ -2,6 +2,7 @@ import Foundation
 import CoreLocation
 import Observation
 import UIKit
+import MLXDeps
 
 struct CachedModelInfo: Identifiable {
     let id: String  // hfId e.g. "mlx-community/Qwen3.5-2B-MLX-8bit"
@@ -41,6 +42,88 @@ final class SettingsManager {
 
     var sharedEngine: MLXEngine?
     private let locationProvider = PromptLocationProvider()
+
+    // MARK: - Model test / benchmark
+
+    /// True while a "Test Model" run is in flight (drives the Settings spinner).
+    var modelTestRunning = false
+    /// Progress label shown next to the spinner ("Loading model…" / "Generating…").
+    var modelTestStatus: String?
+    /// Result of the most recent "Test Model" run, shown in Settings.
+    var modelTestResult: ModelTestResult?
+
+    /// Runs a single fixed generation with **thinking off** against the selected
+    /// model and records throughput / memory / thermal. Deliberately bypasses the
+    /// `ChatViewModel` pipeline (no tools, no prompt classification, no recovery
+    /// passes) so the numbers are clean and comparable across models and runs.
+    ///
+    /// Selecting a model only marks it "current" — the chat path loads its weights
+    /// lazily on first send — so the test loads the model itself (as an LLM, since
+    /// it's a text-only run) before generating. `MLXEngine.loadModel` self-skips
+    /// when the right model is already resident, so a warm run goes straight to
+    /// generation.
+    func runModelTest() async {
+        guard let hfId = loadedModelId else {
+            modelTestResult = ModelTestResult(
+                error: "No model selected. Choose a model on the Chat screen first, then run the test.")
+            return
+        }
+        modelTestRunning = true
+        modelTestResult = nil
+        modelTestStatus = nil
+        defer {
+            modelTestRunning = false
+            modelTestStatus = nil
+        }
+
+        let modelName = loadedModelName ?? hfId
+
+        do {
+            var engine = sharedEngine
+            var alreadyResident = false
+            if let engine {
+                let loaded = await engine.isModelLoaded
+                let sameModel = await engine.loadedModelId == hfId
+                alreadyResident = loaded && sameModel
+            }
+            if !alreadyResident {
+                modelTestStatus = "Loading model…"
+            }
+            if engine == nil {
+                let newEngine = MLXEngine(memoryLimitGB: gpuMemoryLimitGB)
+                sharedEngine = newEngine
+                engine = newEngine
+            }
+            // Idempotent: returns immediately if this model is already loaded.
+            _ = try await engine!.loadModel(id: hfId, forVision: false)
+
+            modelTestStatus = "Generating…"
+            // Fixed prompt that reliably streams a steady run of output tokens so
+            // the generation-throughput reading is stable and comparable run to run.
+            let messages: [Chat.Message] = [
+                .system("You are a benchmarking assistant. Answer directly and factually. Do not output hidden reasoning."),
+                .user("List the eight planets of the solar system in order from the Sun. For each, give one short factual sentence."),
+            ]
+            // Qwen3.5 non-thinking-general profile (matches real chat usage):
+            // temp 0.7 / top_p 0.8 / top_k 20 / presence_penalty 1.5, thinking off.
+            let result = try await engine!.generateChat(
+                messages: messages,
+                maxTokens: 256,
+                temperature: 0.7,
+                topP: 0.8,
+                topK: 20,
+                presencePenalty: 1.5,
+                enableThinking: false
+            )
+            var test = ModelTestResult(modelName: modelName, metrics: result.metrics)
+            test.thermalState = ProcessInfo.processInfo.thermalState
+            test.error = result.error
+            modelTestResult = test
+        } catch {
+            modelTestResult = ModelTestResult(
+                modelName: modelName, error: error.localizedDescription)
+        }
+    }
 
     var contextSize: Int = 4096 {
         didSet { UserDefaults.standard.set(contextSize, forKey: "contextSize") }
@@ -272,9 +355,11 @@ final class SettingsManager {
         ModelRegistry.find(hfId: hfId)?.displayName ?? hfId
     }
 
-    private var hubModelsDir: URL {
+    /// Root of the on-disk HubCache, matching `MLXEngine.cacheRoot`. Repositories
+    /// live directly under here as `models--<org>--<repo>` (Python cache layout).
+    private var cacheRoot: URL {
         let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        return documents.appending(path: "huggingface/models")
+        return documents.appending(path: "huggingface")
     }
 
     var totalCacheSize: String {
@@ -291,42 +376,49 @@ final class SettingsManager {
     }
 
     var runtimeBuildMarker: String {
-        "qwen3.5-fixes-2026-03-06-001"
+        "ios27-qwen35-sampling-2026-07-22-002"
     }
 
     func refreshCachedModels() {
         let fm = FileManager.default
-        let modelsDir = hubModelsDir
         var models: [CachedModelInfo] = []
 
-        guard let orgDirs = try? fm.contentsOfDirectory(at: modelsDir, includingPropertiesForKeys: nil) else {
+        guard let entries = try? fm.contentsOfDirectory(at: cacheRoot, includingPropertiesForKeys: nil) else {
             cachedModels = []
             downloadedModelIds = []
             return
         }
 
-        for orgDir in orgDirs {
+        for repoDir in entries {
             var isDir: ObjCBool = false
-            guard fm.fileExists(atPath: orgDir.path, isDirectory: &isDir), isDir.boolValue else { continue }
-            let orgName = orgDir.lastPathComponent
-            guard !orgName.hasPrefix(".") else { continue }
+            guard fm.fileExists(atPath: repoDir.path, isDirectory: &isDir), isDir.boolValue else { continue }
 
-            guard let repoDirs = try? fm.contentsOfDirectory(at: orgDir, includingPropertiesForKeys: nil) else { continue }
-            for repoDir in repoDirs {
-                guard fm.fileExists(atPath: repoDir.path, isDirectory: &isDir), isDir.boolValue else { continue }
-                let repoName = repoDir.lastPathComponent
-                guard !repoName.hasPrefix(".") else { continue }
+            // HubCache repo directories follow the Python "models--<org>--<repo>"
+            // convention; reverse it to the "<org>/<repo>" Hugging Face id.
+            let folder = repoDir.lastPathComponent
+            guard folder.hasPrefix("models--") else { continue }
+            let hfId = folder
+                .dropFirst("models--".count)
+                .components(separatedBy: "--")
+                .joined(separator: "/")
+            guard !hfId.isEmpty else { continue }
 
-                let hfId = "\(orgName)/\(repoName)"
-                let size = directorySize(at: repoDir)
+            // Only count it as downloaded if a snapshot actually exists — a bare
+            // repo dir can linger from an interrupted or evicted download.
+            let snapshots = repoDir.appending(path: "snapshots")
+            let hasSnapshot = (try? fm.contentsOfDirectory(at: snapshots, includingPropertiesForKeys: nil))?
+                .contains { !$0.lastPathComponent.hasPrefix(".") } ?? false
+            guard hasSnapshot else { continue }
 
-                models.append(CachedModelInfo(
-                    id: hfId,
-                    displayName: repoName,
-                    sizeBytes: size,
-                    path: repoDir
-                ))
-            }
+            let displayName = hfId.components(separatedBy: "/").last ?? hfId
+            let size = directorySize(at: repoDir)
+
+            models.append(CachedModelInfo(
+                id: hfId,
+                displayName: displayName,
+                sizeBytes: size,
+                path: repoDir
+            ))
         }
 
         cachedModels = models.sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }

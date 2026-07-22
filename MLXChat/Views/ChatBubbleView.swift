@@ -3,6 +3,7 @@ import SwiftUI
 struct ChatBubbleView: View {
     let message: ChatMessage
     @State private var showCopied = false
+    @State private var thinkingExpanded = true
 
     var body: some View {
         if message.role == .tool {
@@ -10,6 +11,12 @@ struct ChatBubbleView: View {
         } else {
             chatBubble
         }
+    }
+
+    private var hasThinking: Bool {
+        guard message.role == .assistant else { return false }
+        if let t = message.thinkingText, !t.isEmpty { return true }
+        return message.isThinkingInProgress
     }
 
     private var chatBubble: some View {
@@ -43,6 +50,10 @@ struct ChatBubbleView: View {
                             .aspectRatio(contentMode: .fit)
                             .frame(maxWidth: 200, maxHeight: 200)
                             .clipShape(RoundedRectangle(cornerRadius: 8))
+                    }
+
+                    if hasThinking {
+                        thinkingView
                     }
 
                     if !(visibleText.isEmpty) {
@@ -101,6 +112,53 @@ struct ChatBubbleView: View {
 
     private var visibleText: String {
         message.displayText ?? message.text
+    }
+
+    @ViewBuilder
+    private var thinkingView: some View {
+        let thinking = message.thinkingText ?? ""
+        let inProgress = message.isThinkingInProgress
+        DisclosureGroup(isExpanded: $thinkingExpanded) {
+            if thinking.isEmpty {
+                if inProgress {
+                    HStack(spacing: 6) {
+                        ProgressView().scaleEffect(0.6)
+                        Text("Reasoning…")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.top, 2)
+                }
+            } else {
+                Text(thinking)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.top, 2)
+            }
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "brain")
+                    .font(.caption2)
+                    .foregroundStyle(.purple)
+                Text(thinkingHeaderText)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .tint(.secondary)
+        .onChange(of: message.isThinkingInProgress) { _, nowInProgress in
+            // Auto-collapse once thinking has finished and the answer is showing.
+            if !nowInProgress && !visibleText.isEmpty {
+                thinkingExpanded = false
+            }
+        }
+    }
+
+    private var thinkingHeaderText: String {
+        if message.isThinkingInProgress { return "Thinking…" }
+        return "Thinking"
     }
 
     @ViewBuilder

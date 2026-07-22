@@ -1,6 +1,5 @@
 import Foundation
-import MLXLMCommon
-import Tokenizers
+import MLXDeps
 
 struct ToolRegistry {
 

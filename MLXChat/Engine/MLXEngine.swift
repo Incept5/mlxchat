@@ -1,16 +1,42 @@
 import Foundation
-import Hub
-import MLX
-import MLXLMCommon
-import MLXLLM
-import MLXVLM
-import Tokenizers
+import MLXDeps
 
 actor MLXEngine {
 
     private var modelContainer: ModelContainer?
     private var currentModelId: String?
     private var isVLM = false
+
+    /// A `Tokenizers` tokenizer kept around only for the Qwen3.5 non-thinking
+    /// template patch (see ``qwen35PatchIfNeeded``). The 3.x model context exposes
+    /// a minimal `MLXLMCommon.Tokenizer` that can't apply a custom template
+    /// literal, so we load a `PreTrainedTokenizer` directly. Cached per model id
+    /// to avoid re-parsing tokenizer.json on every turn.
+    private var cachedPatchTokenizer: (id: String, tokenizer: any Tokenizers.Tokenizer)?
+
+    /// Everything needed to tokenise with the patched Qwen3.5 template.
+    private struct Qwen35Patch: Sendable {
+        let tokenizer: any Tokenizers.Tokenizer
+        let template: String
+    }
+
+    /// Root of the on-disk model cache (Python-compatible HubCache layout:
+    /// `<root>/models--<org>--<repo>/snapshots/<commit>/…`).
+    ///
+    /// mlx-swift-lm 3.x downloads through a `HubClient`, whose default cache in a
+    /// sandboxed app is `Library/Caches/huggingface/hub` — and iOS purges
+    /// `Library/Caches` under storage pressure, so a previously-loaded model
+    /// silently disappears and has to be re-downloaded. We pin the cache to
+    /// `Documents/huggingface` instead (non-purgeable, and the location
+    /// `SettingsManager` scans for downloaded models).
+    static let cacheRoot: URL = {
+        let documents = FileManager.default
+            .urls(for: .documentDirectory, in: .userDomainMask).first!
+        return documents.appending(component: "huggingface")
+    }()
+
+    /// Shared Hub client backing every download, pinned to ``cacheRoot``.
+    static let hubClient = HubClient(cache: HubCache(cacheDirectory: cacheRoot))
 
     init(memoryLimitGB: Int = 5) {
         GPU.set(memoryLimit: memoryLimitGB * 1024 * 1024 * 1024)
@@ -31,26 +57,62 @@ actor MLXEngine {
 
         let start = CFAbsoluteTimeGetCurrent()
 
+        // mlx-swift-lm 3.x: tokenizers load through a TokenizerLoader; the macro
+        // wraps AutoTokenizer in the MLXLMCommon protocol.
+        let tokenizerLoader = #huggingFaceTokenizerLoader()
+
+        // Fast path: if a complete copy of the model is already on disk (sideloaded
+        // over USB, or downloaded on a previous run) load straight from its snapshot
+        // directory. This bypasses the HubClient entirely — no network resolution,
+        // no re-download, no offline hang. Essential for sideloaded models: their
+        // weights aren't stored as Hub blobs, so the id-based path treats
+        // `model.safetensors` as "missing" and re-downloads the whole thing.
+        if let localDir = Self.completeLocalSnapshot(forModelId: id) {
+            if forVision {
+                modelContainer = try await VLMModelFactory.shared.loadContainer(
+                    from: localDir, using: tokenizerLoader)
+                isVLM = true
+            } else {
+                do {
+                    modelContainer = try await LLMModelFactory.shared.loadContainer(
+                        from: localDir, using: tokenizerLoader)
+                    isVLM = false
+                } catch {
+                    modelContainer = try await VLMModelFactory.shared.loadContainer(
+                        from: localDir, using: tokenizerLoader)
+                    isVLM = true
+                }
+            }
+            currentModelId = id
+            return CFAbsoluteTimeGetCurrent() - start
+        }
+
+        // Not on disk — download via the Hub. Downloads go through a Downloader
+        // (our Documents-pinned HubClient).
         let config = ModelConfiguration(
             id: id,
             // Qwen3.5 tool use maps to the qwen3_coder-style XML function format.
             toolCallFormat: Self.toolCallFormat(for: id)
         )
         let progressHandler: @Sendable (Progress) -> Void = progress ?? { _ in }
+        let downloader = #hubDownloader(Self.hubClient)
 
         if forVision {
             // Vision requests require VLMModelFactory
             modelContainer = try await VLMModelFactory.shared.loadContainer(
+                from: downloader, using: tokenizerLoader,
                 configuration: config, progressHandler: progressHandler)
             isVLM = true
         } else {
             // Text-only: try LLM first (2x faster, better tool support), fall back to VLM
             do {
                 modelContainer = try await LLMModelFactory.shared.loadContainer(
+                    from: downloader, using: tokenizerLoader,
                     configuration: config, progressHandler: progressHandler)
                 isVLM = false
             } catch {
                 modelContainer = try await VLMModelFactory.shared.loadContainer(
+                    from: downloader, using: tokenizerLoader,
                     configuration: config, progressHandler: progressHandler)
                 isVLM = true
             }
@@ -60,7 +122,46 @@ actor MLXEngine {
         return CFAbsoluteTimeGetCurrent() - start
     }
 
+    /// Returns the on-disk snapshot directory for `id` **iff** a complete copy is
+    /// present: a `snapshots/<hash>/` folder holding `config.json` and its weights
+    /// (single `model.safetensors`, or every shard named by
+    /// `model.safetensors.index.json`). Filesystem-direct — it doesn't rely on Hub
+    /// `refs`/blobs — so it recognises a freshly sideloaded model the HubClient has
+    /// never reconciled. An incomplete copy returns `nil`, falling back to download.
+    static func completeLocalSnapshot(forModelId id: String) -> URL? {
+        let fm = FileManager.default
+        let repoDir = cacheRoot.appending(
+            component: "models--" + id.replacingOccurrences(of: "/", with: "--"))
+        let snapshotsDir = repoDir.appending(component: "snapshots")
+        guard let snapshots = try? fm.contentsOfDirectory(
+            at: snapshotsDir, includingPropertiesForKeys: [.isDirectoryKey]) else { return nil }
+
+        for snapshot in snapshots {
+            let files = Set((try? fm.contentsOfDirectory(atPath: snapshot.path)) ?? [])
+            guard files.contains("config.json") else { continue }
+
+            // Sharded model: require every shard the index references.
+            if files.contains("model.safetensors.index.json"),
+               let index = try? Data(contentsOf: snapshot.appending(component: "model.safetensors.index.json")),
+               let json = try? JSONSerialization.jsonObject(with: index) as? [String: Any],
+               let weightMap = json["weight_map"] as? [String: String] {
+                let shards = Set(weightMap.values)
+                if !shards.isEmpty, shards.isSubset(of: files) { return snapshot }
+            }
+
+            // Single-file weights.
+            if files.contains("model.safetensors") { return snapshot }
+        }
+        return nil
+    }
+
     var loadedAsVLM: Bool { isVLM }
+
+    /// Whether a model is currently resident and ready to generate.
+    var isModelLoaded: Bool { modelContainer != nil }
+
+    /// The HF id of the currently-loaded model, if any.
+    var loadedModelId: String? { currentModelId }
 
     func clearCache() {
         Memory.cacheLimit = 0
@@ -73,7 +174,10 @@ actor MLXEngine {
         maxTokens: Int = 500,
         temperature: Float = 0.6,
         topP: Float = 0.95,
+        topK: Int = 20,
+        minP: Float = 0.0,
         repetitionPenalty: Float? = nil,
+        presencePenalty: Float? = nil,
         enableThinking: Bool? = nil,
         hasImage: Bool = false,
         tools: [ToolSpec]? = nil,
@@ -88,12 +192,19 @@ actor MLXEngine {
             return result
         }
 
-        // Aggressively clear cache, disable it entirely for vision
+        // Drop any pooled buffers *before* generation starts (no command buffer is
+        // in flight yet, so this is safe) to keep peak memory down, then re-enable a
+        // recycle pool for the generation itself. The pool MUST stay non-zero while
+        // generating: with cacheLimit == 0, an MLXArray released while the GPU still
+        // has an in-flight command buffer referencing it frees the underlying
+        // MTLBuffer out from under that command buffer — Metal then aborts with
+        // "command buffer references deallocated object". This bit only the image
+        // path, which previously left the pool disabled throughout (the early-cancel
+        // in the stream loop tears generation down mid async-eval). Images get a
+        // smaller pool than text to keep VLM peak memory in check.
         Memory.cacheLimit = 0
         Memory.clearCache()
-        if !hasImage {
-            Memory.cacheLimit = 512 * 1024 * 1024
-        }
+        Memory.cacheLimit = hasImage ? 256 * 1024 * 1024 : 512 * 1024 * 1024
         let baselineMemory = Double(Memory.activeMemory) / (1024 * 1024)
         Memory.peakMemory = 0
 
@@ -104,13 +215,34 @@ actor MLXEngine {
 
         var currentMessages = messages
 
+        // Original HF id (e.g. "mlx-community/Qwen3.5-4B-MLX-4bit"). After a 3.x
+        // load, `context.configuration` is rebuilt as a local `.directory`, so its
+        // `name` is the snapshot path rather than the repo id — we carry the real
+        // id here so Qwen3.5 detection for the thinking-template patch still works.
+        let modelId = currentModelId
+
+        // For Qwen3.5 with thinking off, build the patched-template tokeniser up
+        // front (cached) so `prepareInput` can use it inside the perform closure.
+        let qwen35Patch = await qwen35PatchIfNeeded(
+            modelId: modelId, enableThinking: enableThinking, hasImage: hasImage)
+
         var generateParams = GenerateParameters(
             temperature: temperature,
-            topP: topP
+            topP: topP,
+            topK: topK,
+            minP: minP
         )
         if let repetitionPenalty {
             generateParams.repetitionPenalty = repetitionPenalty
             generateParams.repetitionContextSize = 64
+        }
+        // Qwen3.5 curbs repetition with a non-zero presence_penalty (~1.5) while
+        // leaving repetition_penalty at 1.0 (off). Use a wide window to approximate
+        // the OpenAI-style whole-sequence presence penalty the model card assumes;
+        // mlx's default window of 20 tokens is too short to match that intent.
+        if let presencePenalty {
+            generateParams.presencePenalty = presencePenalty
+            generateParams.presenceContextSize = 256
         }
 
         let promptStart = CFAbsoluteTimeGetCurrent()
@@ -132,6 +264,7 @@ actor MLXEngine {
                 )) { context, values in
                     let input = try await Self.prepareInput(
                         context: context,
+                        qwen35Patch: qwen35Patch,
                         messages: values.messages,
                         tools: values.tools,
                         additionalContext: values.additionalCtx,
@@ -154,6 +287,8 @@ actor MLXEngine {
                     var detectedToolCall: ToolCall?
                     var cancelledEarly = false
                     var chunkCount = 0
+                    let thinkingDeliberate =
+                        (values.additionalCtx?["enable_thinking"] as? Bool) == true
 
                     for await generation in stream {
                         try Task.checkCancellation()
@@ -166,8 +301,12 @@ actor MLXEngine {
                             if let onChunk, !chunk.isEmpty {
                                 await onChunk(chunk)
                             }
+                            let stuckInThink =
+                                !thinkingDeliberate &&
+                                ThinkingText.isOpen(generatedText) &&
+                                generatedText.count >= min(values.maxTokens, 160)
                             if chunkCount >= values.maxTokens
-                                || (generatedText.contains("<think>") && !generatedText.contains("</think>") && generatedText.count >= min(values.maxTokens, 160))
+                                || stuckInThink
                                 || (generatedText.count >= 60 && Self.hasRepetition(generatedText))
                             {
                                 cancelledEarly = true
@@ -238,7 +377,8 @@ actor MLXEngine {
 
         var result = GenerationResult()
         result.output = finalOutput
-        let cleaned = Self.stripThinkingTags(finalOutput)
+        let (thinking, cleaned) = ThinkingText.split(finalOutput)
+        result.thinkingText = thinking
         // If the model's response is empty after stripping but a tool returned data, use that
         if cleaned.isEmpty, let toolResult = lastToolResult {
             result.cleanedOutput = toolResult
@@ -267,6 +407,7 @@ actor MLXEngine {
     func unloadModel() {
         modelContainer = nil
         currentModelId = nil
+        cachedPatchTokenizer = nil
         Memory.cacheLimit = 0
         Memory.clearCache()
     }
@@ -281,20 +422,17 @@ actor MLXEngine {
 
     private static func prepareInput(
         context: ModelContext,
+        qwen35Patch: Qwen35Patch?,
         messages: [Chat.Message],
         tools: [ToolSpec]?,
         additionalContext: [String: any Sendable]?,
         hasImage: Bool
     ) async throws -> LMInput {
-        if !hasImage,
-           let chatTemplate = correctedChatTemplateIfNeeded(
-               configuration: context.configuration,
-               additionalContext: additionalContext
-           ) {
+        if let qwen35Patch {
             let rawMessages = DefaultMessageGenerator().generate(messages: messages)
-            let promptTokens = try context.tokenizer.applyChatTemplate(
+            let promptTokens = try qwen35Patch.tokenizer.applyChatTemplate(
                 messages: rawMessages,
-                chatTemplate: .literal(chatTemplate),
+                chatTemplate: .literal(qwen35Patch.template),
                 addGenerationPrompt: true,
                 truncation: false,
                 maxLength: nil,
@@ -312,29 +450,55 @@ actor MLXEngine {
         return try await context.processor.prepare(input: userInput)
     }
 
-    private static func correctedChatTemplateIfNeeded(
-        configuration: ModelConfiguration,
-        additionalContext: [String: any Sendable]?
-    ) -> String? {
+    /// Builds the patched-template tokeniser for a Qwen3.5 turn with thinking
+    /// off, or returns `nil` when the patch doesn't apply. The tokeniser is
+    /// cached per model id (``cachedPatchTokenizer``) so tokenizer.json is only
+    /// parsed once per loaded model.
+    private func qwen35PatchIfNeeded(
+        modelId: String?,
+        enableThinking: Bool?,
+        hasImage: Bool
+    ) async -> Qwen35Patch? {
         guard
-            isQwen35_4B(configuration.name),
-            let enableThinking = additionalContext?["enable_thinking"] as? Bool,
+            !hasImage,
+            let modelId, Self.isQwen35(modelId),
             enableThinking == false,
-            let chatTemplate = loadChatTemplate(for: configuration)
+            let modelDirectory = Self.snapshotDirectory(forModelId: modelId),
+            let rawTemplate = try? String(
+                contentsOf: modelDirectory.appending(path: "chat_template.jinja"),
+                encoding: .utf8)
         else {
             return nil
         }
 
-        return patchQwen35_4BNonThinkingTemplate(chatTemplate)
+        let template = Self.patchQwen35NonThinkingTemplate(rawTemplate)
+
+        if let cached = cachedPatchTokenizer, cached.id == modelId {
+            return Qwen35Patch(tokenizer: cached.tokenizer, template: template)
+        }
+        guard let tokenizer = try? await AutoTokenizer.from(modelFolder: modelDirectory) else {
+            return nil
+        }
+        cachedPatchTokenizer = (modelId, tokenizer)
+        return Qwen35Patch(tokenizer: tokenizer, template: template)
     }
 
-    private static func loadChatTemplate(for configuration: ModelConfiguration) -> String? {
-        let modelDirectory = configuration.modelDirectory(hub: HubApi())
-        let templateURL = modelDirectory.appending(path: "chat_template.jinja")
-        return try? String(contentsOf: templateURL, encoding: .utf8)
+    /// Resolves the local snapshot directory for a downloaded model id via the
+    /// shared HubCache (the parent of its `chat_template.jinja`).
+    private static func snapshotDirectory(forModelId id: String) -> URL? {
+        guard
+            let cache = hubClient.cache,
+            let repo = Repo.ID(rawValue: id),
+            let templateFile = cache.cachedFilePath(
+                repo: repo, kind: .model, revision: "main",
+                filename: "chat_template.jinja")
+        else {
+            return nil
+        }
+        return templateFile.deletingLastPathComponent()
     }
 
-    private static func patchQwen35_4BNonThinkingTemplate(_ chatTemplate: String) -> String {
+    private static func patchQwen35NonThinkingTemplate(_ chatTemplate: String) -> String {
         let brokenBlock = """
         {%- if enable_thinking is defined and enable_thinking is false %}
                 {{- '<think>\\n\\n</think>\\n\\n' }}
@@ -360,10 +524,9 @@ actor MLXEngine {
         )
     }
 
-    private static func isQwen35_4B(_ name: String) -> Bool {
+    private static func isQwen35(_ name: String) -> Bool {
         let normalized = name.lowercased()
-        return (normalized.contains("qwen3.5") || normalized.contains("qwen3_5"))
-            && normalized.contains("4b")
+        return normalized.contains("qwen3.5") || normalized.contains("qwen3_5")
     }
 
     // MARK: - Tool Call Parsing (from decoded text, matching benchmark approach)
@@ -568,36 +731,4 @@ actor MLXEngine {
         return result.isEmpty ? nil : result
     }
 
-    private static func stripThinkingTags(_ text: String) -> String {
-        var result = text
-        // Strip matched <think>...</think> pairs
-        let pattern = #"<think>[\s\S]*?</think>"#
-        if let regex = try? NSRegularExpression(pattern: pattern, options: []) {
-            let range = NSRange(result.startIndex..., in: result)
-            result = regex.stringByReplacingMatches(in: result, range: range, withTemplate: "")
-        }
-        // Strip orphaned </think> — only discard content before it if there's
-        // substantial content after it (otherwise it's the actual response)
-        if let closeRange = result.range(of: "</think>") {
-            let after = String(result[closeRange.upperBound...])
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            if after.count >= 2 {
-                result = after
-            } else {
-                result = result.replacingOccurrences(of: "</think>", with: "")
-            }
-        }
-        // Strip orphaned <think> — only discard content after it if there's
-        // substantial content before it
-        if let openRange = result.range(of: "<think>") {
-            let before = String(result[..<openRange.lowerBound])
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            if before.count >= 2 {
-                result = before
-            } else {
-                result = result.replacingOccurrences(of: "<think>", with: "")
-            }
-        }
-        return result.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
 }

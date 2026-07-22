@@ -1,7 +1,6 @@
 import Foundation
 import UIKit
-import MLXLMCommon
-import Tokenizers
+import MLXDeps
 
 @MainActor
 @Observable
@@ -81,22 +80,44 @@ final class ChatViewModel {
                 braveAPIKeyAvailable: hasBraveKey
             )
 
+            // Surfaces download progress while loading so a (re)download — e.g.
+            // after iOS evicts cached weights — never looks like a frozen
+            // "Loading…". `base` is the label shown before any progress arrives.
+            func loadProgress(_ base: String) -> @Sendable (Progress) -> Void {
+                { [weak self] progress in
+                    let fraction = progress.fractionCompleted
+                    Task { @MainActor in
+                        guard let self, self.statusMessage != nil else { return }
+                        if fraction > 0, fraction < 1 {
+                            self.statusMessage =
+                                "\(base) \(Int((fraction * 100).rounded()))%"
+                        }
+                    }
+                }
+            }
+
             if engine == nil {
-                statusMessage = "Loading \(model.displayName)..."
+                let base = "Loading \(model.displayName)..."
+                statusMessage = base
                 let newEngine = MLXEngine(memoryLimitGB: settings.gpuMemoryLimitGB)
-                _ = try await newEngine.loadModel(id: model.hfId, forVision: needsVision)
+                _ = try await newEngine.loadModel(
+                    id: model.hfId, forVision: needsVision, progress: loadProgress(base))
                 settings.sharedEngine = newEngine
                 engine = newEngine
             } else {
                 let currentlyVLM = await engine!.loadedAsVLM
                 if needsVision && !currentlyVLM {
                     // Currently loaded as LLM but need VLM for image — reload
-                    statusMessage = "Loading vision model..."
-                    _ = try await engine!.loadModel(id: model.hfId, forVision: true)
+                    let base = "Loading vision model..."
+                    statusMessage = base
+                    _ = try await engine!.loadModel(
+                        id: model.hfId, forVision: true, progress: loadProgress(base))
                 } else if !needsVision && currentlyVLM {
                     // Currently loaded as VLM but no image — reload as LLM for speed + better tools
-                    statusMessage = "Loading \(model.displayName)..."
-                    _ = try await engine!.loadModel(id: model.hfId, forVision: false)
+                    let base = "Loading \(model.displayName)..."
+                    statusMessage = base
+                    _ = try await engine!.loadModel(
+                        id: model.hfId, forVision: false, progress: loadProgress(base))
                 }
             }
 
@@ -110,7 +131,7 @@ final class ChatViewModel {
                 await engine.clearCache()
             }
 
-            statusMessage = "Generating..."
+            statusMessage = thinkingEnabled ? "Thinking..." : "Generating..."
 
             var chatMessages: [Chat.Message] = []
             let toolsActive = Self.shouldEnableTools(
@@ -120,13 +141,19 @@ final class ChatViewModel {
             )
             let useDirectToolPrefetch = preflightTool != nil
             let currentInfoPrompt = Self.requiresCurrentInfo(text)
+            let simplePrompt = Self.isSimplePrompt(text)
+            let creativePrompt = Self.isCreativePrompt(text)
+            let imageDescriptionPrompt = image != nil && Self.isImageDescriptionPrompt(text)
 
             // Always add system prompt with variable substitution
             let systemPromptText = settings.processedSystemPrompt()
             var systemText = systemPromptText
             if model.supportsNoThink {
                 if thinkingEnabled {
-                    systemText += "\nThinking mode is enabled for this turn."
+                    systemText += "\nThinking mode is enabled for this turn. Keep reasoning brief — at most a few short sentences — then emit </think> and give the answer."
+                    if simplePrompt {
+                        systemText += " For greetings and short prompts, one short thought is enough."
+                    }
                 } else {
                     systemText += "\nThinking mode is disabled for this turn. Reply with only the final answer. Do not output hidden reasoning, self-corrections, or deliberation. For simple questions, answer in one short sentence."
                 }
@@ -166,26 +193,30 @@ final class ChatViewModel {
             }
 
             let contextSize = settings.contextSize
-            let simplePrompt = Self.isSimplePrompt(text)
-            let creativePrompt = Self.isCreativePrompt(text)
-            let imageDescriptionPrompt = image != nil && Self.isImageDescriptionPrompt(text)
             // Tools + thinking tags burn tokens before the actual response
             let maxTokens = imageDescriptionPrompt ? min(360, contextSize / 6) :
                 image != nil ? min(280, contextSize / 7) :
                 (toolsActive || useDirectToolPrefetch) ? min(400, contextSize / 10) :
                 simplePrompt && !thinkingEnabled ? min(48, contextSize / 24) :
+                simplePrompt && thinkingEnabled ? min(384, contextSize / 10) :
                 creativePrompt ? min(640, contextSize / 6) :
                 thinkingEnabled ? min(1200, contextSize / 4) :
                 min(160, contextSize / 16)
 
-            // Qwen3.5 official guidance uses enable_thinking plus 0.7 / 0.8 / 1.0
-            // for normal non-thinking text generation. We keep a lower temperature
-            // only for trivial prompts to bias toward direct answers.
+            // Qwen3.5 official sampling (HF model card): thinking-general
+            // temp 1.0 / top_p 0.95; non-thinking-general temp 0.7 / top_p 0.8; both
+            // top_k 20 (top_k 40 for creative/reasoning), min_p 0. Repetition is
+            // controlled by a non-zero presence_penalty (~1.5) with repetition_penalty
+            // left at 1.0 (off) — a change from Qwen3, which used repetition_penalty.
+            // We keep a lower temperature for trivial prompts to bias toward short,
+            // direct answers, and rely on the `trimRepetition` safety net for the rare
+            // loops presence_penalty misses.
             let enableThinking: Bool? = model.isThinkingModel && model.supportsNoThink
                 ? thinkingEnabled : nil
-            let temperature: Float = thinkingEnabled ? 0.6 : (simplePrompt ? 0.35 : 0.7)
+            let temperature: Float = thinkingEnabled ? 1.0 : (simplePrompt ? 0.35 : 0.7)
             let topP: Float = thinkingEnabled ? 0.95 : 0.8
-            let repetitionPenalty: Float = thinkingEnabled ? 1.1 : 1.0
+            let topK: Int = creativePrompt ? 40 : 20
+            let presencePenalty: Float = 1.5
 
             // Build tools if enabled
             let toolSchemas: [ToolSpec]?
@@ -276,19 +307,25 @@ final class ChatViewModel {
             }
 
             // Set up streaming callback
-            let streaming = settings.streamingEnabled && !(simplePrompt && !thinkingEnabled)
+            let streaming = settings.streamingEnabled
             let onChunk: (@MainActor @Sendable (String) -> Void)?
             if streaming {
-                messages.append(ChatMessage(role: .assistant, text: ""))
+                var placeholder = ChatMessage(role: .assistant, text: "")
+                placeholder.isThinkingInProgress = thinkingEnabled
+                messages.append(placeholder)
                 streamingMessageIndex = messages.count - 1
+                let revealThinking = thinkingEnabled
                 onChunk = { [weak self] chunk in
                     guard let self, let idx = self.streamingMessageIndex,
                           idx < self.messages.count else { return }
                     self.messages[idx].text += chunk
-                    // Live-strip think tags so they never show in the UI
-                    let cleaned = Self.stripThinkingTags(self.messages[idx].text)
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                    self.messages[idx].displayText = cleaned
+                    let (thinking, answer) = ThinkingText.split(self.messages[idx].text)
+                    self.messages[idx].displayText = answer
+                    if revealThinking {
+                        self.messages[idx].thinkingText = thinking.isEmpty ? nil : thinking
+                        self.messages[idx].isThinkingInProgress =
+                            ThinkingText.isOpen(self.messages[idx].text)
+                    }
                 }
             } else {
                 onChunk = nil
@@ -299,7 +336,8 @@ final class ChatViewModel {
                 maxTokens: maxTokens,
                 temperature: temperature,
                 topP: topP,
-                repetitionPenalty: repetitionPenalty,
+                topK: topK,
+                presencePenalty: presencePenalty,
                 enableThinking: enableThinking,
                 hasImage: image != nil,
                 tools: toolSchemas,
@@ -315,6 +353,44 @@ final class ChatViewModel {
                 thinkingEnabled: thinkingEnabled
             )
             var finalMetrics = result.metrics
+            var finalThinking = thinkingEnabled ? result.thinkingText : ""
+
+            if thinkingEnabled,
+               !finalThinking.isEmpty,
+               finalOutput.isEmpty,
+               image == nil,
+               !toolsActive
+            {
+                // Main turn used all its tokens inside <think> and never
+                // produced an answer. Do a short non-thinking pass so the user
+                // still gets a reply.
+                let answerSystemText = systemText + "\nReasoning has already been done. Reply with only the user-facing answer in one short sentence. Do not output <think> tags."
+                var answerMessages = chatMessages
+                answerMessages[0] = .system(answerSystemText)
+                let answerResult = try await engine.generateChat(
+                    messages: answerMessages,
+                    maxTokens: min(64, maxTokens / 4),
+                    temperature: 0.3,
+                    topP: 0.8,
+                    repetitionPenalty: 1.0,
+                    enableThinking: false,
+                    hasImage: false,
+                    tools: nil,
+                    toolDispatch: nil,
+                    onToolCall: nil,
+                    onToolResult: nil,
+                    onChunk: nil
+                )
+                let answerOutput = Self.postProcessAssistantOutput(
+                    answerResult.cleanedOutput,
+                    simplePrompt: simplePrompt,
+                    thinkingEnabled: false
+                )
+                if !answerOutput.isEmpty {
+                    finalOutput = answerOutput
+                    finalMetrics = answerResult.metrics
+                }
+            }
 
             if !thinkingEnabled,
                image == nil,
@@ -346,6 +422,7 @@ final class ChatViewModel {
                 if !retryOutput.isEmpty, !Self.looksLikeReasoningOnlyOutput(retryOutput) {
                     finalOutput = retryOutput
                     finalMetrics = retryResult.metrics
+                    finalThinking = ""
                 }
             }
 
@@ -357,18 +434,30 @@ final class ChatViewModel {
                 removePendingToolPlaceholderIfNeeded()
                 error = err
             } else if streaming, let idx = streamingMessageIndex, idx < messages.count {
-                let streamedOutput = Self.stripThinkingTags(messages[idx].text)
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let (streamedThinking, streamedAnswer) = ThinkingText.split(messages[idx].text)
                 let shouldKeepStreamedOutput =
-                    !streamedOutput.isEmpty &&
-                    !Self.looksLikeReasoningOnlyOutput(streamedOutput) &&
-                    streamedOutput.count > finalOutput.count + 40
+                    !streamedAnswer.isEmpty &&
+                    !Self.looksLikeReasoningOnlyOutput(streamedAnswer) &&
+                    streamedAnswer.count > finalOutput.count + 40
 
-                messages[idx].text = shouldKeepStreamedOutput ? streamedOutput : finalOutput
+                messages[idx].text = shouldKeepStreamedOutput ? streamedAnswer : finalOutput
                 messages[idx].displayText = nil
                 messages[idx].metrics = finalMetrics
+                let thinkingForDisplay = thinkingEnabled
+                    ? (shouldKeepStreamedOutput ? streamedThinking : finalThinking)
+                    : ""
+                messages[idx].thinkingText = thinkingForDisplay.isEmpty ? nil : thinkingForDisplay
+                messages[idx].isThinkingInProgress = false
             } else {
-                messages.append(ChatMessage(role: .assistant, text: finalOutput, metrics: finalMetrics))
+                var assistant = ChatMessage(
+                    role: .assistant,
+                    text: finalOutput,
+                    metrics: finalMetrics
+                )
+                if !finalThinking.isEmpty {
+                    assistant.thinkingText = finalThinking
+                }
+                messages.append(assistant)
             }
 
             streamingMessageIndex = nil
@@ -390,12 +479,16 @@ final class ChatViewModel {
 
         // Finalize any streaming message with whatever text was generated so far
         if let idx = streamingMessageIndex, idx < messages.count {
-            let rawText = messages[idx].text
-            let cleaned = Self.stripThinkingTags(rawText).trimmingCharacters(in: .whitespacesAndNewlines)
-            if cleaned.isEmpty {
+            let (thinking, cleaned) = ThinkingText.split(messages[idx].text)
+            if cleaned.isEmpty && thinking.isEmpty {
                 messages.remove(at: idx)
             } else {
                 messages[idx].text = cleaned
+                messages[idx].displayText = nil
+                if thinkingEnabled, !thinking.isEmpty {
+                    messages[idx].thinkingText = thinking
+                }
+                messages[idx].isThinkingInProgress = false
             }
         }
         streamingMessageIndex = nil
@@ -410,40 +503,12 @@ final class ChatViewModel {
         error = nil
     }
 
-    private static func stripThinkingTags(_ text: String) -> String {
-        var result = text
-        let pattern = #"<think>[\s\S]*?</think>"#
-        if let regex = try? NSRegularExpression(pattern: pattern, options: []) {
-            let range = NSRange(result.startIndex..., in: result)
-            result = regex.stringByReplacingMatches(in: result, range: range, withTemplate: "")
-        }
-        if let closeRange = result.range(of: "</think>") {
-            let after = String(result[closeRange.upperBound...])
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            if after.count >= 2 {
-                result = after
-            } else {
-                result = result.replacingOccurrences(of: "</think>", with: "")
-            }
-        }
-        if let openRange = result.range(of: "<think>") {
-            let before = String(result[..<openRange.lowerBound])
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            if before.count >= 2 {
-                result = before
-            } else {
-                result = result.replacingOccurrences(of: "<think>", with: "")
-            }
-        }
-        return result
-    }
-
     private static func postProcessAssistantOutput(
         _ text: String,
         simplePrompt: Bool,
         thinkingEnabled: Bool
     ) -> String {
-        let cleaned = stripThinkingTags(text).trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleaned = ThinkingText.stripped(text)
         guard !cleaned.isEmpty, !thinkingEnabled else { return cleaned }
 
         if let leaked = salvageFromReasoningLeak(cleaned, simplePrompt: simplePrompt) {

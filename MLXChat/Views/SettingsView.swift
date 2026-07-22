@@ -225,6 +225,49 @@ struct SettingsView: View {
                     Text("Tools let the model search the web and fetch URLs. A Brave API key enables web search (get one free at brave.com/search/api).")
                 }
 
+                Section {
+                    Button {
+                        Task { await settings.runModelTest() }
+                    } label: {
+                        HStack {
+                            Label("Test Model", systemImage: "speedometer")
+                            Spacer()
+                            if settings.modelTestRunning {
+                                if let status = settings.modelTestStatus {
+                                    Text(status)
+                                        .font(.footnote)
+                                        .foregroundStyle(.secondary)
+                                }
+                                ProgressView()
+                            }
+                        }
+                    }
+                    .disabled(settings.modelTestRunning)
+
+                    if let result = settings.modelTestResult {
+                        if let error = result.error {
+                            Text(error)
+                                .font(.footnote)
+                                .foregroundStyle(.red)
+                        } else {
+                            let m = result.metrics
+                            MetricRow(label: "Model", value: result.modelName)
+                            MetricRow(label: "Input speed", value: String(format: "%.1f tok/s", m.promptTokensPerSecond))
+                            MetricRow(label: "Output speed", value: String(format: "%.1f tok/s", m.tokensPerSecond))
+                            MetricRow(label: "Prompt tokens", value: "\(m.promptTokenCount)")
+                            MetricRow(label: "Output tokens", value: "\(m.generationTokenCount)")
+                            MetricRow(label: "Peak memory", value: String(format: "%.0f MB", m.peakMemoryMB))
+                            MetricRow(label: "Baseline memory", value: String(format: "%.0f MB", m.baselineMemoryMB))
+                            MetricRow(label: "Total time", value: String(format: "%.2f s", m.totalTimeSeconds))
+                            MetricRow(label: "Thermal (power proxy)", value: result.thermalLabel)
+                        }
+                    }
+                } header: {
+                    Text("Model Test")
+                } footer: {
+                    Text("Runs one fixed prompt with thinking off and measures throughput, memory and thermal state. iOS exposes no direct power reading, so thermal state is the closest live proxy.")
+                }
+
                 Section("Device Info") {
                     let totalRAM = Double(ProcessInfo.processInfo.physicalMemory) / (1024 * 1024 * 1024)
                     let availableRAM = totalRAM * 0.6
