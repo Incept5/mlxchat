@@ -3,6 +3,8 @@ import MLX
 import MLXLMCommon
 import MLXLLM
 import MLXVLM
+import MLXHuggingFace
+import HuggingFace
 import Tokenizers
 
 // MARK: - Configuration
@@ -340,17 +342,22 @@ struct ToolTestApp {
         // Load model with LLMModelFactory (same as iOS text-only path)
         printHeader("Loading model with LLMModelFactory")
         let config = ModelConfiguration(id: defaultModelId, toolCallFormat: .xmlFunction)
+        // mlx-swift-lm 3.x: load through a Downloader + TokenizerLoader. Defaults
+        // to a standard HubClient / AutoTokenizer.
+        let downloader = #hubDownloader()
+        let tokenizerLoader = #huggingFaceTokenizerLoader()
         let container: ModelContainer
         do {
             container = try await LLMModelFactory.shared.loadContainer(
-                configuration: config) { p in
+                from: downloader, using: tokenizerLoader, configuration: config) { p in
                     let pct = Int(p.fractionCompleted * 100)
                     if pct % 25 == 0 { print("  \(pct)%") }
                 }
             print("  Loaded successfully")
         } catch {
             print("  LLM failed: \(error), trying VLM...")
-            container = try await VLMModelFactory.shared.loadContainer(configuration: config)
+            container = try await VLMModelFactory.shared.loadContainer(
+                from: downloader, using: tokenizerLoader, configuration: config)
         }
         clearCache()
 

@@ -2,16 +2,16 @@ name: MLXChat
 options:
   bundleIdPrefix: com.mlxchat
   deploymentTarget:
-    iOS: "26.0"
-  xcodeVersion: "16.0"
+    iOS: "27.0"
+  xcodeVersion: "27.0"
 
+# The app consumes the MLX / HuggingFace stack through the local MLXDeps wrapper
+# package, NOT the remote packages directly. MLXDeps disables mlx-swift-lm's
+# default-on `FoundationModelsIntegration` trait (`traits: []`) — which Xcode 27's
+# project-level trait handling can't do reliably. See Packages/MLXDeps/Package.swift.
 packages:
-  mlx-swift-lm:
-    url: https://github.com/ml-explore/mlx-swift-lm
-    branch: main
-  swift-transformers:
-    url: https://github.com/huggingface/swift-transformers
-    from: "1.1.9"
+  MLXDeps:
+    path: Packages/MLXDeps
 
 targets:
   MLXChat:
@@ -23,22 +23,20 @@ targets:
     settings:
       base:
         CODE_SIGN_ENTITLEMENTS: MLXChat/MLXChat.entitlements
-        PRODUCT_BUNDLE_IDENTIFIER: com.mlxchat.MLXChat
-        MARKETING_VERSION: "1.0.0"
-        CURRENT_PROJECT_VERSION: "1"
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: S32NZ4QVZF
+        PRODUCT_BUNDLE_IDENTIFIER: com.incept5.mlxchat
+        MARKETING_VERSION: "1.1.0"
+        CURRENT_PROJECT_VERSION: "2"
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_UILaunchScreen_Generation: true
         INFOPLIST_KEY_NSCameraUsageDescription: "Take photos to send to the AI model"
         INFOPLIST_KEY_NSLocationWhenInUseUsageDescription: "Use your approximate location in system prompt variables when relevant"
         INFOPLIST_KEY_NSPhotoLibraryUsageDescription: "Select photos to send to the AI model"
+        INFOPLIST_KEY_UIFileSharingEnabled: YES
+        INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace: YES
         TARGETED_DEVICE_FAMILY: "1,2"
         SWIFT_VERSION: "5.9"
     dependencies:
-      - package: mlx-swift-lm
-        product: MLXLMCommon
-      - package: mlx-swift-lm
-        product: MLXLLM
-      - package: mlx-swift-lm
-        product: MLXVLM
-      - package: swift-transformers
-        product: Tokenizers
+      - package: MLXDeps
+        product: MLXDeps
